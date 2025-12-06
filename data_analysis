@@ -35,15 +35,12 @@ MQTT_TOPIC = "bioreactor_sim/nofaults/telemetry/summary"
 # One message per second; 600 ≈ 10 minutes
 TRAIN_SAMPLES = 600
 
-# Variables to model and their ARIMA(p,d,q) orders
-# You can tune these per-variable if you like.
 VARIABLES = {
     "temperature_C": (2, 1, 2),
     "pH": (2, 1, 2),
     "rpm": (2, 1, 2),
 }
 
-# Output file containing a dict: {var_name: fitted_model}
 MODEL_PATH = "arima_models.pkl"
 
 
@@ -52,8 +49,8 @@ MODEL_PATH = "arima_models.pkl"
 # ==========================
 
 data_lock = threading.Lock()
-timestamps = []                     # shared time index
-values = {v: [] for v in VARIABLES} # per-variable value lists
+timestamps = []                     
+values = {v: [] for v in VARIABLES} 
 
 training_done_event = threading.Event()
 shutdown_event = threading.Event()
@@ -84,17 +81,11 @@ def on_message(client, userdata, msg):
         return
 
     try:
-        # JSON structure (from slides / spec):
-        # "window": {"start": ..., "end": ..., "seconds": 1, "samples": ...}
-        # "temperature_C": {"mean": ..., "min": ..., "max": ...}
-        # "pH": {"mean": ..., ...}
-        # "rpm": {"mean": ..., ...}
         window_end = data["window"]["end"]
         ts = datetime.fromtimestamp(window_end)
 
         sample = {}
         for var in VARIABLES.keys():
-            # each of temperature_C, pH, rpm has subfield "mean"
             sample[var] = float(data[var]["mean"])
 
         with data_lock:
@@ -102,10 +93,8 @@ def on_message(client, userdata, msg):
             for var, val in sample.items():
                 values[var].append(val)
 
-            # assume all variables collected together, so use one length as count
             n = len(timestamps)
 
-        # Simple live printout
         print(
             f"[{n:4d}] {ts}  "
             f"T={sample['temperature_C']:.3f} °C, "
@@ -131,47 +120,44 @@ def train_arima_models():
     with data_lock:
         n_samples = len(timestamps)
         if n_samples < 5:
-            raise RuntimeError(
-                "Not enough data collected to train ARIMA models."
-            )
+            raise RuntimeError("Not enough data collected.")
 
-        # Build a DataFrame with shared time index and each variable as a column
         idx = pd.to_datetime(timestamps)
         df = pd.DataFrame(index=idx)
         for var in VARIABLES.keys():
-            if len(values[var]) != n_samples:
-                raise RuntimeError(
-                    f"Length mismatch for {var}: "
-                    f"{len(values[var])} vs {n_samples} timestamps"
-                )
             df[var] = values[var]
 
         df = df.sort_index()
 
+        ### add interpolation to handle MQTT network errors ###
+        # 1. Drop duplicates (in case of network retries)
+        df = df[~df.index.duplicated(keep='first')]
+        
+        # 2. Force 1-second frequency and fill missing gaps (Critical for ARIMA)
+        df = df.asfreq('1s')
+        df = df.interpolate(method='linear')
+        # ### IMPROVEMENT END ###
+
     print("\nTraining ARIMA models on fault-free data...")
-    print(f"Number of samples: {n_samples}")
-    print(f"First timestamp:  {df.index[0]}")
-    print(f"Last timestamp:   {df.index[-1]}")
+    print(f"Number of samples: {len(df)}") # Updated length after resampling
 
     fitted_models = {}
 
     for var, order in VARIABLES.items():
         series = df[var]
         print(f"\n--- Training ARIMA{order} for {var} ---")
-        model = ARIMA(series, order=order)
+        
+        # ### IMPROVEMENT: Pass freq='1s' explicitly to suppress warnings
+        model = ARIMA(series, order=order, freq='1s')
         fitted = model.fit()
         fitted_models[var] = fitted
 
-        # Show a brief summary header
-        print(f"Model for {var} fitted.")
-        print(fitted.summary().tables[0])  # only top summary table to keep output short
+        print(f"Model for {var} fitted. AIC: {fitted.aic:.2f}")
 
-    # Save dict of fitted models: { "temperature_C": model, "pH": model, "rpm": model }
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(fitted_models, f)
 
     print(f"\nSaved fitted ARIMA models to '{MODEL_PATH}'.")
-    print("Keys:", list(fitted_models.keys()))
 
 
 # ==========================
@@ -181,7 +167,7 @@ def train_arima_models():
 def handle_sigint(signum, frame):
     print("\nSIGINT received, shutting down...")
     shutdown_event.set()
-    training_done_event.set()  # ensure we don't block waiting
+    training_done_event.set()
 
 
 # ==========================
@@ -195,24 +181,19 @@ def main():
     client.on_connect = on_connect
     client.on_message = on_message
 
-    print(f"Connecting to MQTT broker {MQTT_BROKER}:{MQTT_PORT} ...")
+    print(f"Connecting to {MQTT_BROKER}...")
     client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
 
     client.loop_start()
 
-    print(
-        f"Collecting {TRAIN_SAMPLES} samples from '{MQTT_TOPIC}' "
-        "for ARIMA training (Ctrl+C to stop)..."
-    )
-
-    # Wait until enough data or user interruption
+    print(f"Collecting {TRAIN_SAMPLES} samples...")
     training_done_event.wait()
 
     client.loop_stop()
     client.disconnect()
 
     if shutdown_event.is_set() and len(timestamps) < TRAIN_SAMPLES:
-        print("Interrupted before enough data was collected. Exiting.")
+        print("Interrupted. Exiting.")
         sys.exit(1)
 
     try:
