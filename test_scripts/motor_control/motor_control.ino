@@ -5,7 +5,7 @@ const int ENCODER_PIN = 2;   // Interrupt Pin for Encoder
 const int MOTOR_PWM_PIN = 10; // PWM Pin for Motor Speed
 const int PULSES_PER_REVOLUTION = 70;
 
-// PID Variables and Constants (Tune these!)
+// PID Variables and Constants
 double Setpoint, Input, Output;
 double Kp = 2.5, Ki = 0.5, Kd = 0.1;
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
@@ -23,7 +23,6 @@ void encoderISR() {
 }
 
 void applyMotorOutput(int pwm) {
-  // If setpoint is zero, ensure PWM output is zero.
   if (Setpoint == 0 && pwm < 10) { 
     pwm = 0;
   }
@@ -39,7 +38,7 @@ void calculateRPM() {
   
   const double timeInSeconds = (double)controlInterval / 1000.0;
   
-  Input = (double)ticksToMeasure / PULSES_PER_REVOLUTION; // Revolutions
+  Input = (double)ticksToMeasure / PULSES_PER_REVOLUTION; // revolutions
   Input = Input / timeInSeconds;                        // RPS
   Input = Input * 60.0;                                 // RPM
 }
@@ -63,7 +62,6 @@ void processSerialInput() {
 void setup() {
   Serial.begin(115200);
   pinMode(MOTOR_PWM_PIN, OUTPUT);
-  // Removed pinMode and digitalWrite for MOTOR_DIR_PIN
   pinMode(ENCODER_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, RISING);
 

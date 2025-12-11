@@ -1,11 +1,3 @@
-/************************************************************
-   Integrated Bioreactor Controller
-   - Motor speed (RPM) with PID
-   - Heating via thermistor
-   - pH control via acid/base pumps
-   - WiFi (eduroam placeholder) + MQTT over TLS (HiveMQ Cloud)
-************************************************************/
-
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
@@ -13,42 +5,38 @@
 #include <PID_v1.h>
 #include <math.h>
 
-// ===========================================================
-// ------------------------ CONFIG ---------------------------
-// ===========================================================
+// Configuration
 
-// --- eduroam enterprise WiFi config ---
+//eduroam enterprise WiFi config
 #define USE_EDUROAM 1
-#define WIFI_USER "zcabayu@ucl.ac.uk"
+#define WIFI_USER "xxx@ucl.ac.uk" //your email here
 #define WIFI_SSID "eduroam"
-#define WIFI_PASS "xxx"   // TODO: real eduroam password
+#define WIFI_PASS "xxx"   // your password here
 
 const char* ssid     = WIFI_SSID;
-const char* eap_id   = WIFI_USER;   // identity
-const char* eap_user = WIFI_USER;   // username
-const char* eap_pass = WIFI_PASS;   // password
+const char* eap_id   = WIFI_USER;   
+const char* eap_user = WIFI_USER;   
+const char* eap_pass = WIFI_PASS;   
 const char* pass     = WIFI_PASS;
 
-// --- MQTT config (HiveMQ Cloud over TLS) ---
-static const char* mqtt_host = "b6dbb6381f0c4bbf8360ef22013ff085.s1.eu.hivemq.cloud";
+// MQTT config
+static const char* mqtt_host = ""; // MQTT broker address
 static const uint16_t mqtt_port = 8883;
-static const char* mqtt_user = "CSEEE22";
-static const char* mqtt_pass = "Team22thebest";
-static const char* client_id = "reactor-heater-esp32-001";
+static const char* mqtt_user = ""; // username for the MQTT broker
+static const char* mqtt_pass = ""; // password for the MQTT broker
+static const char* client_id = "reactor-arduino-001"; // unique client ID
 
 // Topic names (state)
 const char* TOPIC_STATE_PH    = "reactor/state/ph";
 const char* TOPIC_STATE_HEAT  = "reactor/state/temp";
-const char* TOPIC_STATE_RPM   = "reactor/state/rpm";  // added
+const char* TOPIC_STATE_RPM   = "reactor/state/rpm";  
 
 // Topic names (setpoints)
 const char* TOPIC_SETPOINT_PH   = "reactor/setpoint/ph";
 const char* TOPIC_SETPOINT_TEMP = "reactor/setpoint/temp";
 const char* TOPIC_SETPOINT_RPM  = "reactor/setpoint/rpm";
 
-// ===========================================================
-// ----------------- WPA2-Enterprise includes ----------------
-// ===========================================================
+
 #if __has_include("esp_eap_client.h")
   #include "esp_eap_client.h"
   #define USE_NEW_EAP_API 1
@@ -59,30 +47,23 @@ const char* TOPIC_SETPOINT_RPM  = "reactor/setpoint/rpm";
   #error "No enterprise WiFi API found. Install/upgrade ESP32 core."
 #endif
 
-// ===========================================================
-// --------------------- PIN ASSIGNMENT ----------------------
-// ===========================================================
+// Pin Assignments
 
-// ---- Motor ----
-const int PIN_MOTOR_ENCODER = 4;      // was ENCODER_PIN
-const int PIN_MOTOR_PWM     = 10;     // was MOTOR_PWM_PIN
+// Motor
+const int PIN_MOTOR_ENCODER = 4;     
+const int PIN_MOTOR_PWM     = 10;    
 
-// ---- Heating ----
-const int PIN_THERMISTOR    = A0;     // CHANGED from A0 to avoid conflict with pH sensor
-const int PIN_HEATER        = 2;      // CHANGED from D2
+// Heating
+const int PIN_THERMISTOR    = A0;   
+const int PIN_HEATER        = 2;     
 
-// ---- pH ----
-const int PIN_PH_SENSOR     = A1;     // keep pH on A0
-const int PIN_ACID_PUMP     = 5;      // CHANGED from D3
-const int PIN_BASE_PUMP     = 6;      // CHANGED from D4
+// pH
+const int PIN_PH_SENSOR     = A1;  
+const int PIN_ACID_PUMP     = 5;      
+const int PIN_BASE_PUMP     = 6;     
 
-// ===========================================================
-// -------------------- MOTOR + PID --------------------------
-// ===========================================================
-
+// Stirring constants
 const int PULSES_PER_REVOLUTION = 70;
-
-// PID Variables and Constants
 double rpmSetpoint, rpmInput, rpmOutput;
 double Kp = 2.5, Ki = 0.5, Kd = 0.1;
 PID motorPID(&rpmInput, &rpmOutput, &rpmSetpoint, Kp, Ki, Kd, DIRECT);
@@ -98,18 +79,14 @@ void IRAM_ATTR encoderISR() {
   encoderTicks++;
 }
 
-// ===========================================================
-// ---------------------- HEATING ----------------------------
-// ===========================================================
-
-// Thermistor constants
+// Heating constants
 float R  = 15000.0;
 float R0 = 10000.0;
 float beta = 4220.0;
 float baseKelvin = 298.15; // 25°C in Kelvin
 float VCC = 5.0;           // PSU 5V
 
-// Target temp (setpoint from MQTT)
+// Target temp 
 float targetTempC = 35.0;  // default target
 
 // Measured temp
@@ -119,13 +96,11 @@ bool heaterOn = false;
 const unsigned long HEAT_SAMPLE_INTERVAL = 2000; // ms
 unsigned long lastHeatSampleTime = 0;
 
-// ===========================================================
-// ------------------------ pH -------------------------------
-// ===========================================================
+//pH Constants
 
 // pH sensor calibration
-const float PH_SLOPE  = 3.947;   // from your line equation
-float phOffset        = 2.547;   // adjust after calibration
+const float PH_SLOPE  = 3.947;  
+float phOffset        = 2.547; 
 
 // pH setpoint and band
 float phSetpoint   = 7.0;   // default centre value
