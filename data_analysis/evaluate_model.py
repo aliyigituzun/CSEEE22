@@ -1,24 +1,3 @@
-#!/usr/bin/env python3
-"""
-Evaluate SARIMAX-based anomaly detector on faulted streams.
-
-- Loads trained model bundle from sarimax_models_nofaults.pkl
-- Subscribes to e.g. bioreactor_sim/three_faults/telemetry/summary
-- For each sample:
-    * builds exogenous features (setpoints, PWMs, dosing, etc.)
-    * computes standardized residuals per variable
-    * computes joint score S = sum(z_i^2)
-    * flags anomaly if S > chi2_threshold (from training)
-
-- Compares anomaly flag against ground truth fault label:
-    * y_true = 1 if any faults are active (faults.last_active non-empty), else 0
-- Tracks TP, TN, FP, FN and prints:
-    * precision, recall, F1, accuracy
-
-Requirements:
-    pip install paho-mqtt statsmodels pandas numpy
-"""
-
 import json
 import signal
 import sys
@@ -27,44 +6,34 @@ from datetime import datetime
 import pickle
 import warnings
 
-import numpy as np
 import pandas as pd
 from paho.mqtt import client as mqtt
 
-# Silence some of the spammy statsmodels warnings
+# Do not show useless warnings 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# ==========================
-# CONFIG
-# ==========================
-
+# Congifugration 
 MQTT_BROKER = "engf0001.cs.ucl.ac.uk"
 MQTT_PORT = 1883
 
-# Choose which stream to evaluate on:
 #   "single_fault" or "three_faults" or "variable_setpoints"
-DATA_STREAM = "single_fault"
+DATA_STREAM = "three_faults"
 
 MQTT_TOPIC = f"bioreactor_sim/{DATA_STREAM}/telemetry/summary"
 
-MODEL_PATH = "arima_models.pkl"
+MODEL_PATH = "sarimax_models_nofaults.pkl" # or "arima_model.pkl" from training_old.py for comparison
 
 VARIABLES = ["temperature_C", "pH", "rpm"]
 
-# Minimum history length before we start evaluating (in samples)
+# Minimum history before evaluation
 MIN_HISTORY = 30
-
-
-# ==========================
-# GLOBAL STATE
-# ==========================
 
 data_lock = threading.Lock()
 
-timestamps_eval = []                     # list[datetime]
-values_eval = {v: [] for v in VARIABLES} # dict[var] -> list[float]
-exog_eval = []                           # list[dict exog_name -> float]
+timestamps_eval = []                     
+values_eval = {v: [] for v in VARIABLES} 
+exog_eval = []                           
 
 # model bundle loaded from pickle
 model_bundle = None
@@ -79,17 +48,7 @@ N_SAMPLES = 0
 
 shutdown_event = threading.Event()
 
-
-# ==========================
-# HELPERS
-# ==========================
-
 def build_exog_sample(data):
-    """
-    Build exogenous feature dict from JSON payload.
-    This MUST match the exog definition used in the training script.
-    Adjust here if you changed it there.
-    """
     exog_sample = {
         "temp_setpoint":   float(data["setpoints"]["temperature_C"]),
         "ph_setpoint":     float(data["setpoints"]["pH"]),
@@ -110,18 +69,6 @@ def build_exog_sample(data):
 
 
 def compute_anomaly_and_score():
-    """
-    Using all collected data so far:
-      - construct pandas Series/DataFrames
-      - apply each SARIMAX model to compute one-step-ahead prediction
-      - compute residuals + z-scores
-      - compute joint score S = sum(z_i^2)
-      - compare to chi2_threshold from training
-
-    Returns:
-        anomaly (bool), S (float), per_var_z (dict[var -> z-score])
-        or (None, None, None) if not enough history yet
-    """
     global model_bundle, exog_columns
 
     with data_lock:
@@ -142,7 +89,6 @@ def compute_anomaly_and_score():
         else:
             exog_df = None
 
-    # sort by time just in case
     df = df.sort_index()
     if exog_df is not None:
         exog_df = exog_df.sort_index()
@@ -158,7 +104,6 @@ def compute_anomaly_and_score():
         res_mean = info["res_mean"]
         res_std = info["res_std"] if info["res_std"] > 0 else 1.0
 
-        # Re-apply the fitted parameters to the current data to get states
         if exog_df is not None:
             applied = fitted.apply(endog=series, exog=exog_df)
             pred_res = applied.get_prediction(
@@ -220,10 +165,7 @@ def print_final_scores():
     print(f"Accuracy:  {accuracy:.4f}")
     print("===================================================\n")
 
-
-# ==========================
-# MQTT CALLBACKS
-# ==========================
+# MQTT Functions
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
@@ -248,16 +190,12 @@ def on_message(client, userdata, msg):
         window_end = data["window"]["end"]
         ts = datetime.fromtimestamp(window_end)
 
-        # Primary variables
         sample = {}
         for var in VARIABLES:
             sample[var] = float(data[var]["mean"])
 
-        # Exogenous features
         exog_sample = build_exog_sample(data)
 
-        # Ground-truth label: 1 if any fault active, else 0
-        # faults.last_active is a list of active fault names
         faults_active = data.get("faults", {}).get("last_active", [])
         y_true = 1 if len(faults_active) > 0 else 0
 
@@ -267,7 +205,6 @@ def on_message(client, userdata, msg):
                 values_eval[var].append(val)
             exog_eval.append(exog_sample)
 
-        # Compute anomaly / score
         anomaly, S, per_var_z = compute_anomaly_and_score()
 
         if anomaly is None:
@@ -279,7 +216,6 @@ def on_message(client, userdata, msg):
 
         y_pred = 1 if anomaly else 0
 
-        # Update confusion matrix
         if y_true == 1 and y_pred == 1:
             TP += 1
         elif y_true == 0 and y_pred == 1:
@@ -291,7 +227,6 @@ def on_message(client, userdata, msg):
 
         N_SAMPLES += 1
 
-        # Nicely formatted print for each sample
         status = "ANOM" if anomaly else "OK"
         print(
             f"[{N_SAMPLES:5d}] {ts}  "
@@ -311,24 +246,13 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print(f"Unexpected error processing message: {e}")
 
-
-# ==========================
-# CLEAN SHUTDOWN HANDLER
-# ==========================
-
 def handle_sigint(signum, frame):
-    print("\nSIGINT received, stopping evaluation...")
+    print("\nStopping evaluation...")
     shutdown_event.set()
-
-
-# ==========================
-# MAIN
-# ==========================
 
 def main():
     global model_bundle, exog_columns
 
-    # Load trained model bundle
     print(f"Loading model bundle from '{MODEL_PATH}'...")
     with open(MODEL_PATH, "rb") as f:
         model_bundle = pickle.load(f)
@@ -351,7 +275,6 @@ def main():
 
     print(f"Evaluating on stream '{DATA_STREAM}'. Press Ctrl+C to stop.\n")
 
-    # Wait until Ctrl+C
     try:
         while not shutdown_event.is_set():
             shutdown_event.wait(timeout=1.0)

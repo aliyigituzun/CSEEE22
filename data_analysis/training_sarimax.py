@@ -33,15 +33,13 @@ import pandas as pd
 from paho.mqtt import client as mqtt
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-# ==========================
-# CONFIG
-# ==========================
+# Configuration
 
 MQTT_BROKER = "engf0001.cs.ucl.ac.uk"
 MQTT_PORT = 1883
 MQTT_TOPIC = "bioreactor_sim/nofaults/telemetry/summary"
 
-# One message per second; 3600 ≈ 1 hour
+# One message per second; 3600 = 1 hour
 TRAIN_SAMPLES = 3600
 
 # Variables we model
@@ -58,29 +56,15 @@ CANDIDATE_ORDERS = [
 
 MODEL_PATH = "sarimax_models_nofaults.pkl"
 
-
-# ==========================
-# GLOBALS / STATE
-# ==========================
-
 data_lock = threading.Lock()
-timestamps = []                     # list of datetime objects
-values = {v: [] for v in VARIABLES} # dict: var -> list of floats
-exog_values = []                    # list of dicts (exogenous features per sample)
+timestamps = []                     
+values = {v: [] for v in VARIABLES} 
+exog_values = []                    
 
 training_done_event = threading.Event()
 shutdown_event = threading.Event()
 
-
-# ==========================
-# HELPERS
-# ==========================
-
 def nested_get(d, keys, default=np.nan):
-    """
-    Safely fetch nested values from JSON: nested_get(data, ("foo", "bar"))
-    Returns default (np.nan) if any key is missing.
-    """
     cur = d
     for k in keys:
         if not isinstance(cur, dict) or k not in cur:
@@ -88,10 +72,7 @@ def nested_get(d, keys, default=np.nan):
         cur = cur[k]
     return cur
 
-
-# ==========================
-# MQTT CALLBACKS
-# ==========================
+# MQTT Functions
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
@@ -103,7 +84,6 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 
 def on_message(client, userdata, msg):
-    """Handle incoming telemetry JSON and extract training features."""
     global timestamps, values, exog_values
 
     try:
@@ -114,21 +94,13 @@ def on_message(client, userdata, msg):
         return
 
     try:
-        # Timestamp from window end
         window_end = data["window"]["end"]
         ts = datetime.fromtimestamp(window_end)
 
-        # --- primary variables (same as before) ---
         sample = {}
         for var in VARIABLES:  # ["temperature_C", "pH", "rpm"]
             sample[var] = float(data[var]["mean"])
 
-        # --- exogenous inputs based on YOUR JSON structure ---
-        # All of these are numeric in your example:
-        #   "actuators_avg": {heater_pwm, motor_pwm, acid_pwm, base_pwm}
-        #   "setpoints": {temperature_C, pH, rpm}
-        #   "dosing_l": {acid, base}
-        #   "heater_energy_Wh", "photoevents"
         exog_sample = {
             "temp_setpoint":   float(data["setpoints"]["temperature_C"]),
             "ph_setpoint":     float(data["setpoints"]["pH"]),
@@ -154,7 +126,6 @@ def on_message(client, userdata, msg):
 
             n = len(timestamps)
 
-        # --- nicer print: all the main values in one line ---
         print(
             f"[{n:4d}] {ts}  "
             f"T={sample['temperature_C']:.3f} °C (sp={exog_sample['temp_setpoint']:.2f}), "
@@ -178,17 +149,10 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print(f"Unexpected error processing message: {e}")
 
-# ==========================
-# TRAINING
-# ==========================
+# Training 
 
 def select_best_order_with_exog(series, exog, candidate_orders):
-    """
-    For one variable:
-        - try each (p, d, q) in candidate_orders
-        - fit SARIMAX with exog
-        - return the model with the lowest AIC
-    """
+    # Selects the best (p, d, q) order
     best_aic = np.inf
     best_order = None
     best_model = None
@@ -217,7 +181,6 @@ def select_best_order_with_exog(series, exog, candidate_orders):
 
 
 def train_sarimax_models():
-    """Fit one SARIMAX model per variable with exogenous features."""
     with data_lock:
         n_samples = len(timestamps)
         if n_samples < 5:
@@ -225,15 +188,12 @@ def train_sarimax_models():
 
         idx = pd.to_datetime(timestamps)
 
-        # --- main variables ---
         df = pd.DataFrame(index=idx)
         for var in VARIABLES:
             df[var] = values[var]
 
-        # --- exogenous features ---
         exog_df = pd.DataFrame(exog_values, index=idx)
 
-        # Sort indices
         df = df.sort_index()
         exog_df = exog_df.sort_index()
 
@@ -241,50 +201,35 @@ def train_sarimax_models():
         df = df[~df.index.duplicated(keep="first")]
         exog_df = exog_df[~exog_df.index.duplicated(keep="first")]
 
-        # === resample to 1 Hz and linearly interpolate ===
+        # Interpolation in case data is missing
         df = df.asfreq("1s")
         df = df.interpolate(method="linear")
 
         exog_df = exog_df.asfreq("1s")
 
-        # Replace ±inf with NaN first
         exog_df = exog_df.replace([np.inf, -np.inf], np.nan)
-
-        # Drop exog columns that are entirely NaN (e.g. pumps never used)
+        
+        # Drop exogenous columns that are all NaNs
         all_nan_cols = exog_df.columns[exog_df.isna().all()]
         if len(all_nan_cols) > 0:
             print(f"Dropping exog columns with all NaNs: {list(all_nan_cols)}")
             exog_df = exog_df.drop(columns=list(all_nan_cols))
 
-        # If we dropped everything, just run *without* exogenous variables
-        if exog_df.shape[1] == 0:
-            print("WARNING: no valid exogenous columns left; training plain ARIMA models.")
-            use_exog = False
-            exog_df = None
-        else:
-            use_exog = True
+        use_exog = True
+        exog_df = exog_df.interpolate(method="time")
+        exog_df = exog_df.ffill().bfill()
 
-            # Time interpolation first
-            exog_df = exog_df.interpolate(method="time")
-
-            # Forward/backward fill remaining gaps
-            exog_df = exog_df.ffill().bfill()
-
-        # Align df and exog_df indices (in case of any mismatch)
         if use_exog:
             df, exog_df = df.align(exog_df, join="inner", axis=0)
         else:
-            # Ensure df has no NaNs left
             df = df.dropna(axis=0, how="any")
 
-        # Clip extreme outliers in main variables (very conservative)
         df = df.clip(
             lower=df.quantile(0.001),
             upper=df.quantile(0.999),
             axis=1,
         )
 
-        # Final safety: drop any rows with NaNs in either df or exog_df
         if use_exog:
             mask_bad = df.isna().any(axis=1) | exog_df.isna().any(axis=1)
             if mask_bad.any():
@@ -298,7 +243,6 @@ def train_sarimax_models():
                 df = df[~mask_bad]
 
     print("\nTraining SARIMAX models on fault-free data...")
-    print(f"Number of samples after cleaning: {len(df)}")
     print(f"Index start: {df.index[0]}, end: {df.index[-1]}")
 
     if use_exog:
@@ -311,11 +255,10 @@ def train_sarimax_models():
     model_bundle = {
         "variables": VARIABLES,
         "exog_columns": exog_columns,
-        "models": {},             # per-variable model & stats
-        "chi2_threshold": None,   # global joint threshold
+        "models": {},             
+        "chi2_threshold": None,  
     }
 
-    # Store per-variable z-score series for joint chi-square
     z_residuals = {}
 
     for var in VARIABLES:
@@ -333,7 +276,6 @@ def train_sarimax_models():
 
         print(f"Selected order for {var}: {order}, AIC={fitted.aic:.2f}")
 
-        # In-sample prediction for residual stats
         pred = fitted.predict(start=0, end=len(series) - 1, exog=exog_for_fit)
         residuals = series - pred
 
@@ -353,7 +295,6 @@ def train_sarimax_models():
             "fitted": fitted,
         }
 
-    # Joint chi-square-like score across variables
     z_df = pd.DataFrame(z_residuals)
     S = (z_df ** 2).sum(axis=1)
 
@@ -473,20 +414,10 @@ def train_sarimax_models():
 
     print(f"\nSaved SARIMAX models + stats to '{MODEL_PATH}'.")
 
-
-# ==========================
-# CLEAN SHUTDOWN HANDLER
-# ==========================
-
 def handle_sigint(signum, frame):
-    print("\nSIGINT received, shutting down...")
+    print("\nShutting down...")
     shutdown_event.set()
     training_done_event.set()
-
-
-# ==========================
-# MAIN
-# ==========================
 
 def main():
     signal.signal(signal.SIGINT, handle_sigint)
