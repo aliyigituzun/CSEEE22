@@ -5,38 +5,32 @@
 #include <PID_v1.h>
 #include <math.h>
 
-// Configuration
+// ===========================================================
+// CONFIGURATION
+// ===========================================================
 
-//eduroam enterprise WiFi config
+// Eduroam WiFi config
 #define USE_EDUROAM 1
-#define WIFI_USER "xxx@ucl.ac.uk" //your email here
+#define WIFI_USER "xxx@ucl.ac.uk"
 #define WIFI_SSID "eduroam"
-#define WIFI_PASS "xxx"   // your password here
-
-const char* ssid     = WIFI_SSID;
-const char* eap_id   = WIFI_USER;   
-const char* eap_user = WIFI_USER;   
-const char* eap_pass = WIFI_PASS;   
-const char* pass     = WIFI_PASS;
+#define WIFI_PASS "xxx"
 
 // MQTT config
-static const char* mqtt_host = ""; // MQTT broker address
+static const char* mqtt_host = ""; // MQTT URL
 static const uint16_t mqtt_port = 8883;
-static const char* mqtt_user = ""; // username for the MQTT broker
-static const char* mqtt_pass = ""; // password for the MQTT broker
-static const char* client_id = "reactor-arduino-001"; // unique client ID
+static const char* mqtt_user = ""; // MQTT Username
+static const char* mqtt_pass = ""; // MQTT Password
+static const char* client_id = "reactor-arduino-001"; //unique client ID
 
-// Topic names (state)
+// Topic names
 const char* TOPIC_STATE_PH    = "reactor/state/ph";
 const char* TOPIC_STATE_HEAT  = "reactor/state/temp";
-const char* TOPIC_STATE_RPM   = "reactor/state/rpm";  
-
-// Topic names (setpoints)
+const char* TOPIC_STATE_RPM   = "reactor/state/rpm";
 const char* TOPIC_SETPOINT_PH   = "reactor/setpoint/ph";
 const char* TOPIC_SETPOINT_TEMP = "reactor/setpoint/temp";
 const char* TOPIC_SETPOINT_RPM  = "reactor/setpoint/rpm";
 
-
+// Enterprise WiFi selection
 #if __has_include("esp_eap_client.h")
   #include "esp_eap_client.h"
   #define USE_NEW_EAP_API 1
@@ -47,68 +41,151 @@ const char* TOPIC_SETPOINT_RPM  = "reactor/setpoint/rpm";
   #error "No enterprise WiFi API found. Install/upgrade ESP32 core."
 #endif
 
-// Pin Assignments
+// ===========================================================
+// PIN ASSIGNMENTS
+// ===========================================================
 
 // Motor
-const int PIN_MOTOR_ENCODER = 4;     
-const int PIN_MOTOR_PWM     = 10;    
+const int PIN_MOTOR_ENCODER = 4;
+const int PIN_MOTOR_PWM     = 10;
 
 // Heating
-const int PIN_THERMISTOR    = A0;   
-const int PIN_HEATER        = 2;     
+const int PIN_THERMISTOR    = A0;
+const int PIN_HEATER        = 2;
 
 // pH
-const int PIN_PH_SENSOR     = A1;  
-const int PIN_ACID_PUMP     = 5;      
-const int PIN_BASE_PUMP     = 6;     
+const int PIN_PH_SENSOR     = A1;
+const int PIN_ACID_PUMP     = 5;
+const int PIN_BASE_PUMP     = 6;
 
-// Stirring constants
+// ===========================================================
+// STIRRING SUBSYSTEM
+// ===========================================================
+
 const int PULSES_PER_REVOLUTION = 70;
-double rpmSetpoint, rpmInput, rpmOutput;
+double rpmSetpoint = 0.0, rpmInput = 0.0, rpmOutput = 0.0;
 double Kp = 2.5, Ki = 0.5, Kd = 0.1;
 PID motorPID(&rpmInput, &rpmOutput, &rpmSetpoint, Kp, Ki, Kd, DIRECT);
 
-// Control timing
-const unsigned long controlInterval = 100; // ms
-unsigned long lastMotorControlTime = 0;
+const int MOTOR_PWM_CHANNEL = 0;
+const int MOTOR_PWM_FREQ    = 20000; // 20 kHz (quiet motor drive)
+const int MOTOR_PWM_RES_BITS = 8;    // 8-bit -> duty 0..255
 
-// Encoder state
+const unsigned long MOTOR_CONTROL_INTERVAL = 100;
+unsigned long lastMotorControlTime = 0;
 volatile long encoderTicks = 0;
 
 void IRAM_ATTR encoderISR() {
   encoderTicks++;
 }
 
-// Heating constants
+void applyMotorOutput(int pwm) {
+  if (rpmSetpoint == 0 && pwm < 10) pwm = 0;
+  pwm = constrain(pwm, 0, 255);
+  ledcWrite(MOTOR_PWM_CHANNEL, pwm);
+}
+
+void updateMotor(unsigned long now) {
+  if (now - lastMotorControlTime < MOTOR_CONTROL_INTERVAL) return;
+  lastMotorControlTime = now;
+
+  noInterrupts();
+  long ticks = encoderTicks;
+  encoderTicks = 0;
+  interrupts();
+
+  double timeInSeconds = (double)MOTOR_CONTROL_INTERVAL / 1000.0;
+  rpmInput = (double)ticks / PULSES_PER_REVOLUTION;
+  rpmInput = rpmInput / timeInSeconds * 60.0; // RPM
+
+  motorPID.Compute();
+  applyMotorOutput((int)rpmOutput);
+
+  Serial.print("[MOTOR] Target: ");
+  Serial.print(rpmSetpoint, 0);
+  Serial.print(" RPM | Current: ");
+  Serial.print(rpmInput, 1);
+  Serial.print(" RPM | PWM: ");
+  Serial.println((int)rpmOutput);
+}
+
+// ===========================================================
+// HEATING SUBSYSTEM
+// ===========================================================
+
 float R  = 15000.0;
 float R0 = 10000.0;
 float beta = 4220.0;
-float baseKelvin = 298.15; // 25°C in Kelvin
-float VCC = 5.0;           // PSU 5V
-
-// Target temp 
-float targetTempC = 35.0;  // default target
-
-// Measured temp
+float baseKelvin = 298.15;
+float VCC = 5.0;
+float targetTempC = 35.0;
 float currentTempC = 0.0;
 bool heaterOn = false;
-
-const unsigned long HEAT_SAMPLE_INTERVAL = 2000; // ms
+const unsigned long HEAT_SAMPLE_INTERVAL = 2000;
 unsigned long lastHeatSampleTime = 0;
+const float MAX_TEMP_SAFETY = 60.0; // Safety cutoff
 
-//pH Constants
+void updateHeating(unsigned long now) {
+  if (now - lastHeatSampleTime < HEAT_SAMPLE_INTERVAL) return;
+  lastHeatSampleTime = now;
 
-// pH sensor calibration
-const float PH_SLOPE  = 3.947;  
-float phOffset        = 2.547; 
+  int raw = analogRead(PIN_THERMISTOR);
+  float thermoVoltage = (VCC * raw) / 4095.0;
 
-// pH setpoint and band
-float phSetpoint   = 7.0;   // default centre value
-float phTolerance  = 0.2;   // ±band around setpoint
+  if (thermoVoltage <= 0.0 || thermoVoltage >= VCC) {
+    Serial.println("[HEAT] ERROR: Voltage out of range!");
+    heaterOn = false;
+    digitalWrite(PIN_HEATER, LOW);
+    return;
+  }
 
-float currentPH = 7.0;
+  float thermistorResistance = (R * thermoVoltage) / (VCC - thermoVoltage);
+  float x = log(thermistorResistance / R0);
+  currentTempC = 1.0 / ((1.0 / baseKelvin) + (x / beta)) - 273.15;
 
-// pH control timing/state (non-blocking)
+  // Safety check
+  if (currentTempC > MAX_TEMP_SAFETY) {
+    Serial.println("[HEAT] SAFETY: Max temp exceeded!");
+    heaterOn = false;
+  } else if (currentTempC < targetTempC - 0.5) {
+    heaterOn = true;
+  } else if (currentTempC > targetTempC + 0.5) {
+    heaterOn = false;
+  }
+
+  digitalWrite(PIN_HEATER, heaterOn ? HIGH : LOW);
+
+  Serial.print("[HEAT] Target: ");
+  Serial.print(targetTempC, 1);
+  Serial.print("°C | Current: ");
+  Serial.print(currentTempC, 2);
+  Serial.print("°C | Heater: ");
+  Serial.println(heaterOn ? "ON" : "OFF");
+}
+
+// ===========================================================
+// pH SUBSYSTEM
+// ===========================================================
+
+// pH sensor calibration 
+const float PH_SLOPE  = 3.947;
+float phOffset        = 2.547;
+
+// pH control parameters
+float phSetpoint   = 7.0;
+float phTolerance  = 0.2;
+float currentPH    = 7.0;
+
+// MQTT commmanded setpoint
+float mqttPhSetpoint = 7.0;
+
+// Median filter buffer 
+#define PH_NUM_READINGS 5
+float phBuffer[PH_NUM_READINGS];
+int phBufferIndex = 0;
+bool phBufferFilled = false;
+
+// pH control timing 
 enum PhState {
   PH_IDLE,
   PH_ADDING_ACID,
@@ -118,223 +195,87 @@ enum PhState {
 
 PhState phState = PH_IDLE;
 unsigned long phStateStartMillis = 0;
-
-const unsigned long PH_PUMP_ON_TIME   = 5000;   // 5 s
-const unsigned long PH_MIX_TIME       = 10000;  // 10 s
-const unsigned long PH_SAMPLE_INTERVAL = 1000;  // 1 s
+const unsigned long PH_PUMP_ON_TIME   = 5000;
+const unsigned long PH_MIX_TIME       = 10000;
+const unsigned long PH_SAMPLE_INTERVAL = 1000;
 unsigned long lastPhSampleTime = 0;
 
-// ===========================================================
-// ------------------- WiFi / MQTT ---------------------------
-// ===========================================================
-
-WiFiClientSecure tlsClient;
-PubSubClient mqtt(tlsClient);
-
-// State publish timing
-const unsigned long PUBLISH_INTERVAL = 1000; // ms
-unsigned long lastPublishTime = 0;
-
-// ===========================================================
-// ----------------- HELPER FUNCTIONS ------------------------
-// ===========================================================
-
-// ---- WiFi (you can drop your working eduroam code into this) ----
-void wifi_connect() {
-  Serial.println();
-  Serial.println("Connecting to eduroam...");
-
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_STA);
-
-#if USE_NEW_EAP_API
-  // New enterprise API
-  esp_eap_client_set_identity((const uint8_t*)WIFI_USER, strlen(WIFI_USER));
-  esp_eap_client_set_username((const uint8_t*)WIFI_USER, strlen(WIFI_USER));
-  esp_eap_client_set_password((const uint8_t*)WIFI_PASS, strlen(WIFI_PASS));
-  esp_eap_client_enable();
-  WiFi.begin(WIFI_SSID);
-#else
-  // Old WPA2 enterprise API
-  esp_wifi_sta_wpa2_ent_set_identity((const uint8_t*)WIFI_USER, strlen(WIFI_USER));
-  esp_wifi_sta_wpa2_ent_set_username((const uint8_t*)WIFI_USER, strlen(WIFI_USER));
-  esp_wifi_sta_wpa2_ent_set_password((const uint8_t*)WIFI_PASS, strlen(WIFI_PASS));
-  esp_wifi_sta_wpa2_ent_enable();
-  WiFi.begin(WIFI_SSID);
-#endif
-
-  // Wait for connection
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+// Median calculation function
+float calculateMedian(float arr[], int size) {
+  if (size == 0) return phSetpoint;
+  
+  // Create temporary array for sorting
+  float temp[PH_NUM_READINGS];
+  for (int i = 0; i < size; i++) {
+    temp[i] = arr[i];
   }
-
-  Serial.println();
-  Serial.print("WiFi connected, IP: ");
-  Serial.println(WiFi.localIP());
-}
-
-
-// ---- MQTT callback: setpoints from broker ----
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String msg;
-  for (unsigned int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
-  msg.trim();
-  float value = msg.toFloat();
-
-  Serial.print("MQTT message on [");
-  Serial.print(topic);
-  Serial.print("]: ");
-  Serial.println(msg);
-
-  if (strcmp(topic, TOPIC_SETPOINT_RPM) == 0) {
-    if (value >= 0) {
-      rpmSetpoint = value;
-      Serial.print("New RPM setpoint: ");
-      Serial.println(rpmSetpoint);
-    }
-  } else if (strcmp(topic, TOPIC_SETPOINT_TEMP) == 0) {
-    targetTempC = value;
-    Serial.print("New Temperature setpoint: ");
-    Serial.println(targetTempC);
-  } else if (strcmp(topic, TOPIC_SETPOINT_PH) == 0) {
-    phSetpoint = value;
-    Serial.print("New pH setpoint: ");
-    Serial.println(phSetpoint);
-  }
-}
-
-// ---- MQTT reconnect ----
-void reconnectMQTT() {
-  while (!mqtt.connected()) {
-    Serial.print("Attempting MQTT connection...");
-
-    // TLS: not verifying cert (for lab use)
-    tlsClient.setInsecure();
-
-    if (mqtt.connect(client_id, mqtt_user, mqtt_pass)) {
-      Serial.println("connected");
-
-      // Subscribe to setpoint topics
-      mqtt.subscribe(TOPIC_SETPOINT_RPM);
-      mqtt.subscribe(TOPIC_SETPOINT_TEMP);
-      mqtt.subscribe(TOPIC_SETPOINT_PH);
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(mqtt.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
+  
+  // Bubble sort
+  for (int i = 0; i < size - 1; i++) {
+    for (int j = i + 1; j < size; j++) {
+      if (temp[j] < temp[i]) {
+        float swap = temp[i];
+        temp[i] = temp[j];
+        temp[j] = swap;
+      }
     }
   }
-}
-
-// ---- Motor: apply PID output ----
-void applyMotorOutput(int pwm) {
-  if (rpmSetpoint == 0 && pwm < 10) {
-    pwm = 0;
+  
+  if (size % 2 == 1) {
+    return temp[size / 2];
+  } else {
+    return (temp[size / 2 - 1] + temp[size / 2]) / 2.0;
   }
-  pwm = constrain(pwm, 0, 255);
-  analogWrite(PIN_MOTOR_PWM, pwm);
 }
 
-// ---- Motor: calculate RPM from encoder ----
-void updateMotor(unsigned long now) {
-  if (now - lastMotorControlTime < controlInterval) return;
-  lastMotorControlTime = now;
-
-  noInterrupts();
-  long ticks = encoderTicks;
-  encoderTicks = 0;
-  interrupts();
-
-  double timeInSeconds = (double)controlInterval / 1000.0;
-  rpmInput = (double)ticks / (double)PULSES_PER_REVOLUTION; // revs
-  rpmInput = rpmInput / timeInSeconds;                      // RPS
-  rpmInput = rpmInput * 60.0;                               // RPM
-
-  motorPID.Compute();
-  applyMotorOutput((int)rpmOutput);
-
-  Serial.print("[MOTOR] Target RPM: ");
-  Serial.print(rpmSetpoint);
-  Serial.print(" | Current RPM: ");
-  Serial.print(rpmInput, 1);
-  Serial.print(" | PWM: ");
-  Serial.println((int)rpmOutput);
-}
-
-// ---- Heating: read thermistor and control heater ----
-void updateHeating(unsigned long now) {
-  if (now - lastHeatSampleTime < HEAT_SAMPLE_INTERVAL) return;
-  lastHeatSampleTime = now;
-
-  int raw = analogRead(PIN_THERMISTOR); // assume 12-bit ADC (0-4095)
-  float thermoVoltage = (VCC * raw) / 4095.0;
-
-  if (thermoVoltage <= 0.0 || thermoVoltage >= VCC) {
-    return;
-  }
-
-  float thermistorResistance =
-      (R * thermoVoltage) / (VCC - thermoVoltage);
-
-  float x = log(thermistorResistance / R0);
-  currentTempC = 1.0 / ((1.0 / baseKelvin) + (x / beta)) - 273.15;
-
-  if (currentTempC < targetTempC - 0.5) {
-    heaterOn = true;
-  } else if (currentTempC > targetTempC + 0.5) {
-    heaterOn = false;
-  }
-  digitalWrite(PIN_HEATER, heaterOn ? HIGH : LOW);
-
-  Serial.print("[HEAT] Target: ");
-  Serial.print(targetTempC);
-  Serial.print(" °C | Temp: ");
-  Serial.print(currentTempC);
-  Serial.print(" °C | Heater: ");
-  Serial.println(heaterOn ? "ON" : "OFF");
-}
-
-// ---- pH: read sensor ----
+// Sample pH with median filter
 void samplePH(unsigned long now) {
   if (now - lastPhSampleTime < PH_SAMPLE_INTERVAL) return;
   lastPhSampleTime = now;
 
+  // Read sensor (12-bit ADC)
   int sensorValue = analogRead(PIN_PH_SENSOR);
   float phVoltage = sensorValue * (3.3 / 4095.0);
-  currentPH = PH_SLOPE * phVoltage + phOffset;
 
-  Serial.print("[pH] pH: ");
-  Serial.print(currentPH);
+  float rawPH = PH_SLOPE * phVoltage + phOffset;  
+  phBuffer[phBufferIndex] = rawPH;
+  phBufferIndex = (phBufferIndex + 1) % PH_NUM_READINGS;
+  if (!phBufferFilled && phBufferIndex == 0) {
+    phBufferFilled = true;
+  }
+  
+  // Calculate median
+  int samplesToUse = phBufferFilled ? PH_NUM_READINGS : phBufferIndex;
+  currentPH = calculateMedian(phBuffer, samplesToUse);
+
+  Serial.print("[pH] Raw: ");
+  Serial.print(rawPH, 2);
+  Serial.print(" | Median: ");
+  Serial.print(currentPH, 2);
   Serial.print(" (V=");
   Serial.print(phVoltage, 3);
   Serial.println(")");
 }
 
-// ---- pH: non-blocking control state machine ----
 void updatePH(unsigned long now) {
-  float phLow  = phSetpoint - phTolerance;
+  samplePH(now);
+  
+  float phLow = phSetpoint - phTolerance;
   float phHigh = phSetpoint + phTolerance;
 
   switch (phState) {
     case PH_IDLE:
       digitalWrite(PIN_ACID_PUMP, LOW);
       digitalWrite(PIN_BASE_PUMP, LOW);
-      samplePH(now);
 
       if (currentPH > phHigh) {
-        Serial.println("[pH] HIGH → Adding ACID");
+        Serial.println("[pH] pH HIGH → Adding ACID");
         digitalWrite(PIN_ACID_PUMP, HIGH);
-        digitalWrite(PIN_BASE_PUMP, LOW);
         phState = PH_ADDING_ACID;
         phStateStartMillis = now;
       } else if (currentPH < phLow) {
-        Serial.println("[pH] LOW → Adding BASE");
+        Serial.println("[pH] pH LOW → Adding BASE");
         digitalWrite(PIN_BASE_PUMP, HIGH);
-        digitalWrite(PIN_ACID_PUMP, LOW);
         phState = PH_ADDING_BASE;
         phStateStartMillis = now;
       }
@@ -361,42 +302,148 @@ void updatePH(unsigned long now) {
     case PH_MIXING:
       if (now - phStateStartMillis >= PH_MIX_TIME) {
         phState = PH_IDLE;
-        Serial.println("[pH] Mixing done, back to IDLE.");
+        Serial.println("[pH] Mixing complete → IDLE");
       }
       break;
   }
 }
 
-// ---- MQTT: publish state periodically ----
+// ===========================================================
+// WiFi / MQTT
+// ===========================================================
+
+WiFiClientSecure tlsClient;
+PubSubClient mqtt(tlsClient);
+const unsigned long PUBLISH_INTERVAL = 1000;
+unsigned long lastPublishTime = 0;
+
+void wifi_connect() {
+  Serial.println("\nConnecting to eduroam...");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+
+#if USE_NEW_EAP_API
+  esp_eap_client_set_identity((const uint8_t*)WIFI_USER, strlen(WIFI_USER));
+  esp_eap_client_set_username((const uint8_t*)WIFI_USER, strlen(WIFI_USER));
+  esp_eap_client_set_password((const uint8_t*)WIFI_PASS, strlen(WIFI_PASS));
+  esp_eap_client_enable();
+  WiFi.begin(WIFI_SSID);
+#else
+  esp_wifi_sta_wpa2_ent_set_identity((const uint8_t*)WIFI_USER, strlen(WIFI_USER));
+  esp_wifi_sta_wpa2_ent_set_username((const uint8_t*)WIFI_USER, strlen(WIFI_USER));
+  esp_wifi_sta_wpa2_ent_set_password((const uint8_t*)WIFI_PASS, strlen(WIFI_PASS));
+  esp_wifi_sta_wpa2_ent_enable();
+  WiFi.begin(WIFI_SSID);
+#endif
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected, IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi FAILED! Running offline.");
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  msg.trim();
+  float value = msg.toFloat();
+
+  Serial.print("MQTT [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  Serial.println(msg);
+
+  if (strcmp(topic, TOPIC_SETPOINT_RPM) == 0) {
+    if (value >= 0 && value <= 2000) {
+      rpmSetpoint = value;
+      Serial.print("New RPM: ");
+      Serial.println(rpmSetpoint);
+    }
+  } else if (strcmp(topic, TOPIC_SETPOINT_TEMP) == 0) {
+    if (value >= 0 && value <= 80) {
+      targetTempC = value;
+      Serial.print("New Temp: ");
+      Serial.println(targetTempC);
+    }
+  } else if (strcmp(topic, TOPIC_SETPOINT_PH) == 0) {
+    if (value >= 0 && value <= 14) {
+      phSetpoint = value;
+      Serial.print("New pH: ");
+      Serial.println(phSetpoint);
+    }
+  }
+}
+
+void reconnectMQTT() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  unsigned long mqttStart = millis();
+  while (!mqtt.connected() && millis() - mqttStart < 10000) {
+    Serial.print("MQTT connecting...");
+    tlsClient.setInsecure();
+    
+    if (mqtt.connect(client_id, mqtt_user, mqtt_pass)) {
+      Serial.println("connected");
+      mqtt.subscribe(TOPIC_SETPOINT_RPM);
+      mqtt.subscribe(TOPIC_SETPOINT_TEMP);
+      mqtt.subscribe(TOPIC_SETPOINT_PH);
+      return;
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqtt.state());
+      Serial.println(" retrying...");
+      delay(2000);
+    }
+  }
+  
+  if (!mqtt.connected()) {
+    Serial.println("MQTT FAILED! Running offline.");
+  }
+}
+
 void publishState(unsigned long now) {
   if (now - lastPublishTime < PUBLISH_INTERVAL) return;
   lastPublishTime = now;
+  if (!mqtt.connected()) return;
 
   char buf[32];
-
-  // RPM
   dtostrf(rpmInput, 0, 1, buf);
   mqtt.publish(TOPIC_STATE_RPM, buf);
 
-  // pH
   dtostrf(currentPH, 0, 2, buf);
   mqtt.publish(TOPIC_STATE_PH, buf);
 
-  // Temperature
   dtostrf(currentTempC, 0, 2, buf);
   mqtt.publish(TOPIC_STATE_HEAT, buf);
+
+  Serial.println("[MQTT] State published");
 }
 
 // ===========================================================
-// ------------------------ SETUP ----------------------------
+// SETUP
 // ===========================================================
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("Integrated Bioreactor Controller starting...");
+  Serial.println("\n=== Bioreactor Controller Starting ===");
 
+  // Pin configurations
   pinMode(PIN_MOTOR_PWM, OUTPUT);
+  analogReadResolution(12);
+  ledcSetup(MOTOR_PWM_CHANNEL, MOTOR_PWM_FREQ, MOTOR_PWM_RES_BITS);
+  ledcAttachPin(PIN_MOTOR_PWM, MOTOR_PWM_CHANNEL);
+  ledcWrite(MOTOR_PWM_CHANNEL, 0)
   pinMode(PIN_MOTOR_ENCODER, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_MOTOR_ENCODER), encoderISR, RISING);
 
@@ -409,29 +456,40 @@ void setup() {
   digitalWrite(PIN_ACID_PUMP, LOW);
   digitalWrite(PIN_BASE_PUMP, LOW);
 
-  analogReadResolution(12);
-
-  rpmSetpoint = 0.0;
+  // Motor PID setup
   motorPID.SetMode(AUTOMATIC);
   motorPID.SetOutputLimits(0, 255);
-  motorPID.SetSampleTime(controlInterval);
+  motorPID.SetSampleTime(MOTOR_CONTROL_INTERVAL);
+
+  float initPH = phSetpoint;
+  for (int i = 0; i < PH_NUM_READINGS; i++) {
+    phBuffer[i] = initPH;
+  }
+  Serial.print("pH median buffer initialized: ");
+  Serial.println(initPH, 2);
 
   wifi_connect();
 
-  tlsClient.setInsecure();                  // no CA cert (lab use)
+  // Setup MQTT
+  tlsClient.setInsecure();
   mqtt.setServer(mqtt_host, mqtt_port);
   mqtt.setCallback(mqttCallback);
+
+  delay(2000);
+  Serial.println("=== System Ready ===");
 }
 
 // ===========================================================
-// ------------------------- LOOP ----------------------------
+// LOOP
 // ===========================================================
 
 void loop() {
-  if (!mqtt.connected()) {
-    reconnectMQTT();
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqtt.connected()) {
+      reconnectMQTT();
+    }
+    mqtt.loop();
   }
-  mqtt.loop();
 
   unsigned long now = millis();
 
