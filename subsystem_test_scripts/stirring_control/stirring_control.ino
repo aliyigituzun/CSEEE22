@@ -1,20 +1,16 @@
 #include <PID_v1.h>
 
-// Pins and Encoder
-const int ENCODER_PIN = 2;   // Interrupt Pin for Encoder
-const int MOTOR_PWM_PIN = 10; // PWM Pin for Motor Speed
+const int ENCODER_PIN = 2;
+const int MOTOR_PWM_PIN = 10;
 const int PULSES_PER_REVOLUTION = 70;
 
-// PID Variables and Constants
 double Setpoint, Input, Output;
 double Kp = 2.5, Ki = 0.5, Kd = 0.1;
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
 
-// Control Timing
-const long controlInterval = 100; // ms
+const long controlInterval = 100;
 unsigned long lastTime;
 
-// Motor State
 volatile long encoderTicks = 0;
 long ticksToMeasure = 0;
 
@@ -38,9 +34,9 @@ void calculateRPM() {
   
   const double timeInSeconds = (double)controlInterval / 1000.0;
   
-  Input = (double)ticksToMeasure / PULSES_PER_REVOLUTION; // revolutions
-  Input = Input / timeInSeconds;                        // RPS
-  Input = Input * 60.0;                                 // RPM
+  Input = (double)ticksToMeasure / PULSES_PER_REVOLUTION;
+  Input = Input / timeInSeconds;
+  Input = Input * 60.0;
 }
 
 void processSerialInput() {

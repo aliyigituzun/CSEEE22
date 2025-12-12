@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-Train ARIMA models on fault-free ENGF0001 bioreactor data streamed over MQTT.
-
-This script subscribes to the 'nofaults' stream, collects temperature, pH and
-RPM, and fits a separate ARIMA model to each of these time series.
-
-Requirements:
-    pip install paho-mqtt statsmodels pandas
-
-Network note:
-    You must be on the UCL network or connected via UCL VPN to reach
-    engf0001.cs.ucl.ac.uk:1883.
-"""
 
 import json
 import signal
@@ -24,16 +11,11 @@ import pandas as pd
 from paho.mqtt import client as mqtt
 from statsmodels.tsa.arima.model import ARIMA
 
-# ==========================
-# CONFIG
-# ==========================
-
 MQTT_BROKER = "engf0001.cs.ucl.ac.uk"
 MQTT_PORT = 1883
 MQTT_TOPIC = "bioreactor_sim/nofaults/telemetry/summary"
 
-# One message per second; 600 ≈ 10 minutes
-TRAIN_SAMPLES = 600
+TRAIN_SAMPLES = 600  # ~10 minutes
 
 VARIABLES = {
     "temperature_C": (2, 1, 2),
@@ -44,21 +26,13 @@ VARIABLES = {
 MODEL_PATH = "arima_models.pkl"
 
 
-# ==========================
-# GLOBALS / STATE
-# ==========================
-
 data_lock = threading.Lock()
-timestamps = []                     
+timestamps = []
 values = {v: [] for v in VARIABLES} 
 
 training_done_event = threading.Event()
 shutdown_event = threading.Event()
 
-
-# ==========================
-# MQTT CALLBACKS
-# ==========================
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
@@ -70,7 +44,6 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 
 def on_message(client, userdata, msg):
-    """Handle incoming telemetry JSON and extract the training features."""
     global timestamps, values
 
     try:
@@ -111,12 +84,7 @@ def on_message(client, userdata, msg):
         print(f"Unexpected error processing message: {e}")
 
 
-# ==========================
-# TRAINING FUNCTION
-# ==========================
-
 def train_arima_models():
-    """Fit one ARIMA model per variable (temperature_C, pH, rpm)."""
     with data_lock:
         n_samples = len(timestamps)
         if n_samples < 5:
@@ -129,17 +97,12 @@ def train_arima_models():
 
         df = df.sort_index()
 
-        ### add interpolation to handle MQTT network errors ###
-        # 1. Drop duplicates (in case of network retries)
         df = df[~df.index.duplicated(keep='first')]
-        
-        # 2. Force 1-second frequency and fill missing gaps (Critical for ARIMA)
         df = df.asfreq('1s')
         df = df.interpolate(method='linear')
-        # ### IMPROVEMENT END ###
 
     print("\nTraining ARIMA models on fault-free data...")
-    print(f"Number of samples: {len(df)}") # Updated length after resampling
+    print(f"Number of samples: {len(df)}")
 
     fitted_models = {}
 
@@ -147,7 +110,6 @@ def train_arima_models():
         series = df[var]
         print(f"\n--- Training ARIMA{order} for {var} ---")
         
-        # ### IMPROVEMENT: Pass freq='1s' explicitly to suppress warnings
         model = ARIMA(series, order=order, freq='1s')
         fitted = model.fit()
         fitted_models[var] = fitted
@@ -160,19 +122,11 @@ def train_arima_models():
     print(f"\nSaved fitted ARIMA models to '{MODEL_PATH}'.")
 
 
-# ==========================
-# CLEAN SHUTDOWN HANDLER
-# ==========================
-
 def handle_sigint(signum, frame):
     print("\nSIGINT received, shutting down...")
     shutdown_event.set()
     training_done_event.set()
 
-
-# ==========================
-# MAIN
-# ==========================
 
 def main():
     signal.signal(signal.SIGINT, handle_sigint)

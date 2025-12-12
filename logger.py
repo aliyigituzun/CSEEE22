@@ -5,17 +5,14 @@ from datetime import datetime
 
 import paho.mqtt.client as mqtt
 
-# Configuration 
 LOG_FILE = "logs.csv"
-LOG_INTERVAL_SEC = 1.0 
+LOG_INTERVAL_SEC = 1.0
 
-# MQTT broker configuration
-MQTT_BROKER = "" # MQTT URL
+MQTT_BROKER = "" 
 MQTT_PORT = 8883
 MQTT_USERNAME = "CSEEE22"
 MQTT_PASSWORD = "Team22thebest"
 
-# Topics
 MQTT_TOPIC_PH   = "reactor/state/ph"
 MQTT_TOPIC_TEMP = "reactor/state/temp"
 MQTT_TOPIC_RPM  = "reactor/state/rpm"
@@ -46,7 +43,7 @@ def ensure_log_file_has_header(path: str):
     try:
         with open(path, "r", newline="") as f:
             if f.read(1):
-                return  # file exists and is non-empty
+                return
     except FileNotFoundError:
         pass
 
